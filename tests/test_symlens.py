@@ -98,6 +98,40 @@ PY = textwrap.dedent('''\
             return path
     ''')
 
+TS = textwrap.dedent('''\
+    import x from "y";
+
+    export const API = "/api";
+
+    export interface Props {
+        id: string;
+        onClose: () => void;
+    }
+
+    type Status = "a" | "b";
+
+    export function Widget({ id, open = false }: Props): JSX.Element {
+        const local = compute(id);
+        const handler = () => local;
+        return render(local, handler);
+    }
+
+    export const useThing = (n: number) => {
+        return n * 2;
+    };
+
+    export class Store extends Base {
+        size = 0;
+        constructor(x: number) {
+            this.size = x;
+        }
+        async load(key: string): Promise<void> {
+            await fetch(key);
+        }
+        get total() { return this.size; }
+    }
+    ''')
+
 
 def names(syms):
     return {s.qual: (s.kind, s.start, s.end) for s in syms}
@@ -152,6 +186,29 @@ class PythonOutline(unittest.TestCase):
         self.assertEqual(n["Box.area"], ("method", 15, 17))   # decorator line included
         self.assertEqual(n["Box.load"][0], "method")
 
+    def test_docstrings(self):
+        src = 'def f(x):\n    """first line.\n    second line."""\n    return x\n'
+        doc = {s.qual: s.doc for s in S.outline_python(src)}
+        self.assertEqual(doc["f"], "first line.")
+
+
+class TsOutline(unittest.TestCase):
+    def test_outline(self):
+        n = names(S.outline_ts(TS))
+        self.assertEqual(n["API"][0], "var")
+        self.assertEqual(n["Props"][0], "interface")
+        self.assertEqual(n["Status"][0], "type")
+        self.assertEqual(n["Widget"][0], "function")
+        self.assertEqual(n["useThing"][0], "function")
+        self.assertEqual(n["Store"][0], "class")
+        self.assertEqual(n["Store.constructor"][0], "method")
+        self.assertEqual(n["Store.load"][0], "method")
+        self.assertEqual(n["Store.total"][0], "method")       # accessor: 'get' stripped, name kept
+        _, start, end = n["Widget"]
+        self.assertGreaterEqual(end - start, 3)               # destructured params don't truncate the body
+        self.assertNotIn("Widget.local", n)                   # locals inside a function are not symbols
+        self.assertNotIn("Widget.handler", n)
+
 
 class Operations(unittest.TestCase):
     def setUp(self):
@@ -176,6 +233,15 @@ class Operations(unittest.TestCase):
         self.assertNotIn("  6 ", refs)                     # the definition line itself is not a reference
         self.assertIn("3 symbols", S.op_outline(self.dir, "src/box.py", depth=1))  # LIMIT, helper, Box
 
+    def test_signature_at_docs(self):
+        sig = S.op_body(self.dir, "src/box.py", "helper", signature=True)
+        self.assertIn("def helper(a, b=2) -> int", sig)
+        self.assertNotIn("return inner()", sig)            # signature mode omits the body
+        self.assertIn("Box.area", S.op_at(self.dir, "src/box.py", 16))   # enclosing symbol of a line
+        self.assertIn("symbols", S.op_outline(self.dir, "src/box.py", docs=True))
+        refs = S.op_refs(self.dir, "self.size")            # dotted name matches only `self.size`
+        self.assertIn("self.size", refs)
+
     def test_mcp_roundtrip(self):
         msgs = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -186,16 +252,19 @@ class Operations(unittest.TestCase):
              "params": {"name": "symbol_body", "arguments": {"path": "src/box.py", "name": "Box.load"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
              "params": {"name": "symbol_body", "arguments": {"path": "nope.py", "name": "x"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+             "params": {"name": "enclosing_symbol", "arguments": {"path": "src/box.py", "line": 16}}},
         ]
         inp = "".join(json.dumps(m) + "\n" for m in msgs).encode("utf-8")
         out = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "symlens.py"), "--root",
                               self.dir, "serve"], input=inp, capture_output=True, timeout=60).stdout
         replies = [json.loads(x) for x in out.decode("utf-8").splitlines() if x.strip()]
-        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4])
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4, 5])
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
-        self.assertEqual(len(replies[1]["result"]["tools"]), 4)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 5)
         self.assertIn("async def load", replies[2]["result"]["content"][0]["text"])
         self.assertTrue(replies[3]["result"]["isError"])
+        self.assertIn("Box.area", replies[4]["result"]["content"][0]["text"])
 
 
 if __name__ == "__main__":

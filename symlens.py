@@ -9,8 +9,8 @@ Instead of reading a whole 4000-line file, an agent asks for what it needs:
   refs <name>               where a name is used, each hit tagged with its enclosing symbol
   serve                     the same four operations as an MCP server over stdio (Claude Code, etc.)
 
-Languages: Python (``ast``) and Java (a small tokenizer that skips comments, strings, text blocks and char
-literals and matches braces). Other files are ignored by outline/find; refs can search any extension.
+Languages: Python (``ast``), Java and TypeScript/JavaScript (small tokenizers that skip comments, strings,
+template literals and regex and match braces). Other files are ignored by outline/find; refs search any extension.
 
 A ``.symlens.json`` in the root may list ``exclude`` globs (paths relative to the root, ``**`` allowed)
 for copies, archives and vendored code that would otherwise duplicate results.
@@ -24,20 +24,21 @@ import re
 import sys
 import warnings
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__", ".gitnexus", ".serena",
              ".idea", ".vscode", ".gradle", ".mypy_cache", ".pytest_cache", ".tox", "build", "target", "dist", "out"}
-LANG_BY_EXT = {".py": "python", ".java": "java"}
+LANG_BY_EXT = {".py": "python", ".java": "java", ".ts": "ts", ".tsx": "ts", ".mts": "ts", ".cts": "ts",
+               ".js": "ts", ".jsx": "ts", ".mjs": "ts", ".cjs": "ts"}
 MAX_BODY_LINES = 300
 MAX_RESULTS = 60
 
 
 class Sym:
-    __slots__ = ("qual", "kind", "start", "end", "sig")
+    __slots__ = ("qual", "kind", "start", "end", "sig", "doc")
 
-    def __init__(self, qual, kind, start, end, sig):
-        self.qual, self.kind, self.start, self.end, self.sig = qual, kind, start, end, sig
+    def __init__(self, qual, kind, start, end, sig, doc=""):
+        self.qual, self.kind, self.start, self.end, self.sig, self.doc = qual, kind, start, end, sig, doc
 
     @property
     def name(self):
@@ -78,7 +79,8 @@ def outline_python(src):
                 start = min([d.lineno for d in ch.decorator_list] + [ch.lineno])
                 is_cls = isinstance(ch, ast.ClassDef)
                 kind = "class" if is_cls else ("method" if in_class else "function")
-                out.append(Sym(prefix + ch.name, kind, start, ch.end_lineno, _py_sig(lines, ch)))
+                doc = (ast.get_docstring(ch, clean=False) or "").strip().split("\n", 1)[0][:160]
+                out.append(Sym(prefix + ch.name, kind, start, ch.end_lineno, _py_sig(lines, ch), doc))
                 walk(ch, prefix + ch.name + ".", is_cls)
             elif isinstance(ch, (ast.Assign, ast.AnnAssign)) and (node is tree or in_class):
                 targets = ch.targets if isinstance(ch, ast.Assign) else [ch.target]
@@ -264,6 +266,197 @@ def outline_java(src):
     return out
 
 
+# ───────────────────────────────────────────────────────────────────────────── TypeScript / JavaScript
+_TS_TYPE_KW = {"class": "class", "interface": "interface", "enum": "enum", "namespace": "namespace",
+               "module": "namespace"}
+_TS_MODIFIERS = {"export", "default", "declare", "abstract", "public", "private", "protected", "static",
+                 "readonly", "async", "override", "get", "set", "accessor"}
+_TS_NOT_METHOD = {"if", "for", "while", "switch", "catch", "return", "function", "do", "else", "case",
+                  "await", "typeof", "new", "yield", "with", "super", "in", "of"}
+_REGEX_OK = set("([{,;:=!&|?+-*%<>~^") | {"", "return", "typeof", "instanceof", "in", "of", "new", "do",
+                                          "else", "yield", "await", "case", "delete", "void"}
+
+
+def _ts_tokens(src):
+    """[(token, line)] without comments; a string, template literal or regex becomes one placeholder token."""
+    toks, i, n, line, prev = [], 0, len(src), 1, ""
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1; i += 1
+        elif c in " \t\r\f":
+            i += 1
+        elif c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i); i = n if j < 0 else j
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2); end = n if j < 0 else j + 2
+            line += src.count("\n", i, end); i = end
+        elif c in "'\"":
+            j = i + 1
+            while j < n and src[j] not in (c, "\n"):
+                j += 2 if src[j] == "\\" else 1
+            i = j + 1; prev = "''"; toks.append((prev, line))
+        elif c == "`":                                     # template literal, tracking ${ } nesting
+            j, depth = i + 1, 0
+            while j < n:
+                d = src[j]
+                if d == "\\":
+                    j += 2; continue
+                if d == "`" and depth == 0:
+                    j += 1; break
+                if d == "$" and j + 1 < n and src[j + 1] == "{":
+                    depth += 1; j += 1
+                elif d == "}" and depth > 0:
+                    depth -= 1
+                j += 1
+            line += src.count("\n", i, j); i = j; prev = "``"; toks.append((prev, line))
+        elif c == "/" and prev in _REGEX_OK:               # regex literal (vs division — by preceding token)
+            j, klass = i + 1, False
+            while j < n and src[j] != "\n" and (src[j] != "/" or klass):
+                if src[j] == "\\":
+                    j += 2; continue
+                if src[j] == "[":
+                    klass = True
+                elif src[j] == "]":
+                    klass = False
+                j += 1
+            if j < n and src[j] == "/":
+                j += 1
+                while j < n and src[j].isalpha():          # flags
+                    j += 1
+                i = j; prev = "/re/"; toks.append((prev, line))
+            else:                                          # not a closed regex — treat '/' as punctuation
+                prev = c; toks.append((c, line)); i += 1
+        elif c.isalnum() or c in "_$":
+            j = i
+            while j < n and (src[j].isalnum() or src[j] in "_$"):
+                j += 1
+            prev = src[i:j]; toks.append((prev, line)); i = j
+        elif c == "=" and i + 1 < n and src[i + 1] == ">":    # arrow, kept whole so outliners can spot it
+            prev = "=>"; toks.append((prev, line)); i += 2
+        else:
+            prev = c; toks.append((c, line)); i += 1
+    return toks
+
+
+def _ts_name(t):
+    return bool(t) and (t[:1].isalnum() or t[:1] in "_$") and t not in ('""', "''", "``", "/re/")
+
+
+def _ts_strip(h):
+    """Drop leading decorators (@Foo(...)) and modifiers from a header."""
+    i = 0
+    while i < len(h):
+        t = h[i][0]
+        if t == "@":
+            i += 1
+            while i < len(h) and (h[i][0] == "." or _ts_name(h[i][0])):
+                i += 1
+            if i < len(h) and h[i][0] == "(":
+                depth = 0
+                while i < len(h):
+                    if h[i][0] == "(":
+                        depth += 1
+                    elif h[i][0] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                    i += 1
+            continue
+        if t in _TS_MODIFIERS:
+            i += 1
+            continue
+        break
+    return h[i:]
+
+
+def _ts_find(words, tok):
+    return words.index(tok) if tok in words else -1
+
+
+def _ts_join(h):
+    s, prev = "", ""
+    for t, _ in h:
+        if s and _ts_name(t) and (_ts_name(prev) or prev in (",", ")", ">", "]")):
+            s += " "
+        s += t
+        prev = t
+    return s
+
+
+def _ts_open_sym(h, top, start, ln):
+    """Classify a header ending in '{'. Returns a Sym or None."""
+    words = [t for t, _ in h]
+    eq = _ts_find(words, "=")
+    for k, t in enumerate(words):                          # class/interface/enum/namespace NAME {
+        if t in _TS_TYPE_KW and (k == 0 or words[k - 1] != ".") and k + 1 < len(words) and _ts_name(words[k + 1]):
+            return Sym(top["qual"] + words[k + 1], _TS_TYPE_KW[t], start, ln, _ts_join(h))
+    fi = _ts_find(words, "function")                       # function NAME ( ) { / function* NAME
+    if fi >= 0:
+        j = fi + 1 + (1 if fi + 1 < len(words) and words[fi + 1] == "*" else 0)
+        if j < len(words) and _ts_name(words[j]):
+            return Sym(top["qual"] + words[j], "method" if top["in_type"] else "function", start, ln, _ts_join(h))
+    if "=>" in words and eq > 0 and _ts_name(words[eq - 1]) and words[eq - 1] not in _TS_NOT_METHOD \
+            and (top["in_type"] or top.get("vars_ok")):     # NAME = (...) => {  only as a module const / class field
+        return Sym(top["qual"] + words[eq - 1], "method" if top["in_type"] else "function", start, ln, _ts_join(h[:eq]))
+    if top["in_type"]:                                     # method inside a class/interface: NAME ( ) {
+        p = _ts_find(words, "(")
+        if p > 0 and _ts_name(words[p - 1]) and words[p - 1] not in _TS_NOT_METHOD and (eq < 0 or p < eq):
+            return Sym(top["qual"] + words[p - 1], "method", start, ln, _ts_join(h))
+    return None
+
+
+def _ts_stmt_sym(h, top, start, ln):
+    """Statement-level symbol at ';': type alias, or a top-level const/let/var."""
+    words = [t for t, _ in h]
+    if len(words) >= 2 and words[0] == "type" and _ts_name(words[1]):
+        eq = _ts_find(words, "=")
+        return Sym(top["qual"] + words[1], "type", start, ln, _ts_join(h[:eq] if eq > 0 else h))
+    if len(words) >= 2 and words[0] in ("const", "let", "var") and _ts_name(words[1]) and top.get("vars_ok"):
+        kind = "function" if "=>" in words else "var"
+        return Sym(top["qual"] + words[1], kind, start, ln, _ts_join(h) if kind == "function" else "")
+    return None
+
+
+def outline_ts(src):
+    toks = _ts_tokens(src)
+    out, header, pdepth = [], [], 0
+    stack = [{"in_type": False, "vars_ok": True, "sym": None, "qual": ""}]
+    for tok, ln in toks:
+        if tok in ("(", "["):
+            pdepth += 1
+        elif tok in (")", "]") and pdepth > 0:
+            pdepth -= 1
+        if pdepth > 0 or tok not in ("{", "}", ";"):       # {}/; inside (...)/[...] are params/types, not structure
+            header.append((tok, ln))
+            continue
+        top = stack[-1]
+        if tok == "}":
+            if len(stack) > 1:
+                done = stack.pop()
+                if done["sym"] is not None:
+                    done["sym"].end = ln
+            header = []
+            continue
+        raw, header = header, []
+        start = raw[0][1] if raw else ln
+        h = _ts_strip(raw)
+        if tok == ";":
+            sym = _ts_stmt_sym(h, top, start, ln)
+            if sym:
+                out.append(sym)
+            continue
+        sym = _ts_open_sym(h, top, start, ln)                # tok == "{"
+        if sym:
+            out.append(sym)
+            stack.append({"in_type": sym.kind in ("class", "interface", "enum"),
+                          "vars_ok": sym.kind == "namespace", "sym": sym, "qual": sym.qual + "."})
+        else:
+            stack.append({"in_type": False, "vars_ok": False, "sym": None, "qual": top["qual"]})
+    return out
+
+
 # ───────────────────────────────────────────────────────────────────────────── files
 def read_text(path):
     with open(path, encoding="utf-8-sig", errors="replace") as fh:
@@ -325,10 +518,10 @@ def outline(path):
     else:
         src = read_text(path)
         try:
-            syms = outline_python(src) if lang == "python" else outline_java(src)
+            syms = outline_python(src) if lang == "python" else outline_java(src) if lang == "java" else outline_ts(src)
         except SyntaxError as exc:
             raise ValueError("cannot parse %s: %s" % (path, exc))
-        _disk()[full] = [stamp, [[s.qual, s.kind, s.start, s.end, s.sig] for s in syms]]
+        _disk()[full] = [stamp, [[s.qual, s.kind, s.start, s.end, s.sig, s.doc] for s in syms]]
         _DISK["dirty"] = True
     _CACHE[full] = (stamp, syms)
     return syms
@@ -380,7 +573,7 @@ def enclosing(syms, line):
 
 
 # ───────────────────────────────────────────────────────────────────────────── operations
-def op_outline(root, path, depth=0, kinds=None):
+def op_outline(root, path, depth=0, kinds=None, docs=False):
     full = _resolve(root, path)
     syms = outline(full)
     lines = []
@@ -389,18 +582,24 @@ def op_outline(root, path, depth=0, kinds=None):
             continue
         if kinds and s.kind not in kinds:
             continue
-        lines.append("  " * s.qual.count(".") + s.line())
+        row = "  " * s.qual.count(".") + s.line()
+        if docs and s.doc:
+            row += "  · " + s.doc
+        lines.append(row)
     head = "%s — %d symbols" % (_rel(root, full), len(lines))
     return head + ("\n" + "\n".join(lines) if lines else "")
 
 
-def op_body(root, path, name, line=None, numbered=False, max_lines=MAX_BODY_LINES):
+def op_body(root, path, name, line=None, numbered=False, max_lines=MAX_BODY_LINES, signature=False):
     full = _resolve(root, path)
     syms = [s for s in outline(full) if _match(s, name)]
     if line:
         syms = [s for s in syms if s.start <= int(line) <= s.end] or syms
     if not syms:
         return "no symbol %r in %s (try outline)" % (name, _rel(root, full))
+    rel = _rel(root, full)
+    if signature:                                     # interface only: the header carries the signature; add first doc line
+        return "\n".join("# %s%s" % (s.line(rel), "\n    " + s.doc if s.doc else "") for s in syms[:12])
     src = read_text(full).splitlines()
     parts = []
     for s in syms[:5]:
@@ -409,7 +608,7 @@ def op_body(root, path, name, line=None, numbered=False, max_lines=MAX_BODY_LINE
         if numbered:
             body = ["%d\t%s" % (s.start + k, t) for k, t in enumerate(body)]
         tail = "\n… %d more lines (max_lines)" % (s.end - hi) if hi < s.end else ""
-        parts.append("# %s\n%s%s" % (s.line(_rel(root, full)), "\n".join(body), tail))
+        parts.append("# %s\n%s%s" % (s.line(rel), "\n".join(body), tail))
     more = "\n(+%d more matches — pass line=)" % (len(syms) - 5) if len(syms) > 5 else ""
     return "\n\n".join(parts) + more
 
@@ -431,7 +630,11 @@ def op_find(root, name, kind=None, glob=None, substring=False, max_results=MAX_R
 
 def op_refs(root, name, glob=None, exts=None, max_results=MAX_RESULTS):
     word = name.rsplit(".", 1)[-1]
-    rx = re.compile(r"(?<![\w$])%s(?![\w$])" % re.escape(word))
+    qualifier = name[:len(name) - len(word) - 1] if "." in name else ""
+    if qualifier:                                      # refs 'session.close' → only `session.close`, not every `.close`
+        rx = re.compile(r"(?<![\w$])%s\s*\.\s*%s(?![\w$])" % (re.escape(qualifier), re.escape(word)))
+    else:
+        rx = re.compile(r"(?<![\w$])%s(?![\w$])" % re.escape(word))
     out, count = [], 0
     for rel in walk(root, glob, exts):
         full = os.path.join(root, rel)
@@ -462,6 +665,15 @@ def op_refs(root, name, glob=None, exts=None, max_results=MAX_RESULTS):
     return "\n".join(out) if out else "no references to %r" % word
 
 
+def op_at(root, path, line):
+    """The symbol (function/method/class) that contains a 1-based line — for a traceback, diff hunk or grep hit."""
+    full = _resolve(root, path)
+    enc = enclosing(outline(full), int(line))
+    if enc is None:
+        return "no enclosing symbol at %s:%s" % (_rel(root, full), line)
+    return enc.line(_rel(root, full))
+
+
 def _resolve(root, path):
     full = path if os.path.isabs(path) else os.path.join(root, path)
     if not os.path.isfile(full):
@@ -480,48 +692,61 @@ def _rel(root, full):
 _P = {"path": {"type": "string", "description": "file path, relative to the server root or absolute"}}
 TOOLS = [
     {"name": "symbols_overview",
-     "description": "Outline of a Python or Java file: classes, functions, methods, fields with line ranges. "
-                    "Use before reading a large file.",
+     "description": "Outline of a Python/Java/TypeScript file: classes, functions, methods, fields with line ranges. "
+                    "Use INSTEAD of reading a whole file. Pass docs=true for a one-line docstring per symbol — often "
+                    "enough to understand the file without any symbol_body call.",
      "inputSchema": {"type": "object", "properties": dict(_P, depth={
-         "type": "integer", "description": "0 = all nesting levels; 1 = top level only"}),
+         "type": "integer", "description": "0 = all nesting levels; 1 = top level only"}, docs={
+         "type": "boolean", "description": "append each symbol's first docstring line"}),
          "required": ["path"]}},
     {"name": "symbol_body",
      "description": "Source of one symbol: 'Cls.method', 'method', 'func.inner'. Overloads are all returned "
-                    "(narrow with line).",
+                    "(narrow with line). Pass signature=true for just the signature + docstring (interface, no body).",
      "inputSchema": {"type": "object", "properties": dict(_P, name={"type": "string"}, line={"type": "integer"},
-                                                         numbered={"type": "boolean"},
+                                                         numbered={"type": "boolean"}, signature={"type": "boolean"},
                                                          max_lines={"type": "integer"}),
                      "required": ["path", "name"]}},
     {"name": "find_symbol",
-     "description": "Where a symbol is defined across the tree (Python, Java): path:lines kind name — signature.",
+     "description": "Where a symbol is defined across the tree (Python, Java, TypeScript): path:lines kind name — signature.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}, "kind": {"type": "string"}, "glob": {"type": "string"},
          "substring": {"type": "boolean"}, "max_results": {"type": "integer"}}, "required": ["name"]}},
     {"name": "find_references",
-     "description": "Where a name is used, each line tagged with its enclosing symbol. glob narrows files; exts "
-                    "adds extensions (e.g. ['.ts']).",
+     "description": "Where a name is used, each line tagged with its enclosing symbol — use INSTEAD of grep for "
+                    "'who uses X'. A dotted name ('obj.method') matches only that access, cutting noise on common "
+                    "method names. glob narrows files; exts adds extensions (e.g. ['.ts']).",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}, "glob": {"type": "string"},
          "exts": {"type": "array", "items": {"type": "string"}}, "max_results": {"type": "integer"}},
          "required": ["name"]}},
+    {"name": "enclosing_symbol",
+     "description": "The function/method/class that contains a given 1-based line — resolve a traceback, diff hunk "
+                    "or grep hit to its symbol.",
+     "inputSchema": {"type": "object", "properties": dict(_P, line={"type": "integer"}),
+                     "required": ["path", "line"]}},
 ]
-INSTRUCTIONS = ("symlens: read code by symbol, not by file. symbols_overview(path) first; then symbol_body(path, "
-                "name) for just the part you need; find_symbol(name) to locate a definition; find_references(name) "
-                "for usages with their enclosing symbol. Paths are relative to the server root.")
+INSTRUCTIONS = ("symlens: read code by symbol, not by file — prefer it over reading whole files or grepping for "
+                "symbols; it keeps large files out of context. Recipe: symbols_overview(path) [docs=true for a "
+                "one-line-per-symbol map] instead of reading a file; symbol_body(path, name) [signature=true for just "
+                "the interface] instead of reading a region; find_symbol(name) instead of grep+read to locate a "
+                "definition; find_references(name) instead of grep for usages (a dotted 'obj.method' cuts noise); "
+                "enclosing_symbol(path, line) to name the symbol at a line. Paths are relative to the server root.")
 
 
 def call_tool(root, name, a):
     if name == "symbols_overview":
-        return op_outline(root, a["path"], int(a.get("depth") or 0))
+        return op_outline(root, a["path"], int(a.get("depth") or 0), docs=bool(a.get("docs")))
     if name == "symbol_body":
         return op_body(root, a["path"], a["name"], a.get("line"), bool(a.get("numbered")),
-                       int(a.get("max_lines") or MAX_BODY_LINES))
+                       int(a.get("max_lines") or MAX_BODY_LINES), signature=bool(a.get("signature")))
     if name == "find_symbol":
         return op_find(root, a["name"], a.get("kind"), a.get("glob"), bool(a.get("substring")),
                        int(a.get("max_results") or MAX_RESULTS))
     if name == "find_references":
         exts = sorted(set(LANG_BY_EXT) | set(a.get("exts") or ())) if a.get("exts") else None
         return op_refs(root, a["name"], a.get("glob"), exts, int(a.get("max_results") or MAX_RESULTS))
+    if name == "enclosing_symbol":
+        return op_at(root, a["path"], a["line"])
     raise ValueError("unknown tool: %s" % name)
 
 
@@ -579,12 +804,17 @@ def main(argv=None):
     p = sub.add_parser("outline")
     p.add_argument("path")
     p.add_argument("--depth", type=int, default=0)
+    p.add_argument("--docs", action="store_true", help="append each symbol's first docstring line")
     p = sub.add_parser("body")
     p.add_argument("path")
     p.add_argument("name")
     p.add_argument("--line", type=int)
     p.add_argument("--numbered", action="store_true")
+    p.add_argument("--signature", action="store_true", help="just the signature + docstring, no body")
     p.add_argument("--max-lines", type=int, default=MAX_BODY_LINES)
+    p = sub.add_parser("at")
+    p.add_argument("path")
+    p.add_argument("line", type=int)
     p = sub.add_parser("find")
     p.add_argument("name")
     p.add_argument("--kind")
@@ -608,9 +838,11 @@ def main(argv=None):
         pass
     try:
         if a.cmd == "outline":
-            print(op_outline(root, a.path, a.depth))
+            print(op_outline(root, a.path, a.depth, docs=a.docs))
         elif a.cmd == "body":
-            print(op_body(root, a.path, a.name, a.line, a.numbered, a.max_lines))
+            print(op_body(root, a.path, a.name, a.line, a.numbered, a.max_lines, signature=a.signature))
+        elif a.cmd == "at":
+            print(op_at(root, a.path, a.line))
         elif a.cmd == "find":
             print(op_find(root, a.name, a.kind, a.glob, a.substring, a.max))
         else:
